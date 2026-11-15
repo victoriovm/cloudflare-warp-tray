@@ -1,0 +1,101 @@
+name: Nightly Build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-upload:
+    if: github.event_name == 'workflow_dispatch' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build Windows executable
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: go build -trimpath -ldflags="-H=windowsgui -s -w" -o dist/warp-tray.exe .
+
+      - name: Find or create Nightly Release
+        id: release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              ...context.repo,
+              per_page: 100,
+            });
+            const matches = releases.filter(release => release.name === 'Nightly Release');
+            if (matches.length > 1) {
+              throw new Error('Multiple releases named "Nightly Release" found; cannot safely choose one to update.');
+            }
+            let release = matches[0];
+            if (!release) {
+              try {
+                const existing = await github.rest.repos.getReleaseByTag({
+                  ...context.repo,
+                  tag: 'nightly',
+                });
+                release = existing.data;
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                const created = await github.rest.repos.createRelease({
+                  ...context.repo,
+                  tag_name: 'nightly',
+                  target_commitish: context.sha,
+                  name: 'Nightly Release',
+                  body: '',
+                  generate_release_notes: false,
+                  draft: false,
+                  prerelease: false,
+                });
+                release = created.data;
+              }
+            }
+            core.setOutput('tag', release.tag_name);
+            core.setOutput('id', String(release.id));
+
+      - name: Replace executable in existing release
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: gh release upload "$env:RELEASE_TAG" dist/warp-tray.exe --clobber
+
+      - name: Keep release title and empty description
+        uses: actions/github-script@v7
+        env:
+          RELEASE_ID: ${{ steps.release.outputs.id }}
+        with:
+          script: |
+            await github.rest.repos.updateRelease({
+              ...context.repo,
+              release_id: Number(process.env.RELEASE_ID),
+              name: 'Nightly Release',
+              body: '',
+              draft: false,
+              prerelease: false,
+            });
